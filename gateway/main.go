@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"time"
+
+	"example.com/gateway-ledger/gateway/internal/api"
+	"example.com/gateway-ledger/ledger"
 )
 
 func newHandler() http.Handler {
@@ -18,10 +22,18 @@ func newHandler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("pong"))
 	})
-	return mux
+	mux.Handle("/api/", api.NewHandler())
+	return api.Logging(mux)
 }
 
 func main() {
+	// The ledger package is imported as a library, so the gateway connects it
+	// to PostgreSQL (DATABASE_URL) and Redis (REDIS_ADDR) when it starts.
+	if err := ledger.Connect(context.Background()); err != nil {
+		log.Fatalf("cannot connect Ledger storage: %v", err)
+	}
+	defer ledger.Close()
+
 	server := &http.Server{
 		Addr:              ":8080",
 		Handler:           newHandler(),

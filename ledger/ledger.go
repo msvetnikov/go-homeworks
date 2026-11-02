@@ -1,12 +1,21 @@
-package main
+// Package ledger keeps transactions and category budgets.
+//
+// Data lives in PostgreSQL after Connect is called; before that (for example
+// in unit tests) an in-memory store is used. Report summaries and the budget
+// list are cached in Redis when it is available.
+package ledger
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math"
-	"strings"
+	"log"
+	"time"
+
+	"example.com/gateway-ledger/ledger/internal/cache"
+	"example.com/gateway-ledger/ledger/internal/db"
 )
 
 type Transaction struct {
@@ -23,46 +32,132 @@ type Budget struct {
 	Limit    float64 `json:"limit"`
 }
 
+var ErrBudgetExceeded = errors.New("budget exceeded")
+
+const opTimeout = 5 * time.Second
+
+// store is where transactions and budgets are kept.
+type store interface {
+	addTransaction(ctx context.Context, tx Transaction) (id int, err error)
+	listTransactions(ctx context.Context) ([]Transaction, error)
+	setBudget(ctx context.Context, b Budget) error
+	listBudgets(ctx context.Context) ([]Budget, error)
+	categoryTotals(ctx context.Context, from, to string) ([]CategoryTotal, error)
+	reset(ctx context.Context) error
+	close() error
+}
+
 var (
-	transactions      = make([]Transaction, 0)
-	budgets           = make(map[string]Budget)
-	ErrBudgetExceeded = errors.New("budget exceeded")
+	current store = newMemStore()
+	// kv is nil when Redis is not configured or not reachable.
+	kv kvCache
 )
 
-func AddTransaction(tx Transaction) error {
-	if tx.Amount <= 0 || math.IsNaN(tx.Amount) || math.IsInf(tx.Amount, 0) {
-		return errors.New("transaction amount must be a positive finite number")
+// Connect opens PostgreSQL (required) and Redis (optional) using environment
+// variables and makes them the storage of the package.
+func Connect(ctx context.Context) error {
+	sqlDB, err := db.Open(ctx)
+	if err != nil {
+		return fmt.Errorf("connect to PostgreSQL (%s): %w", db.Describe(), err)
 	}
-	if strings.TrimSpace(tx.Category) == "" {
-		return errors.New("transaction category must not be empty")
+	log.Printf("ledger: connected to PostgreSQL (%s)", db.Describe())
+	current = &pgStore{db: sqlDB}
+
+	redisCache, err := cache.Open(ctx)
+	if err != nil {
+		log.Printf("ledger: Redis is unavailable, caching is disabled: %v", err)
+		return nil
 	}
-	if budget, ok := budgets[tx.Category]; ok {
-		total := tx.Amount
-		for _, saved := range transactions {
-			if saved.Category == tx.Category {
-				total += saved.Amount
-			}
-		}
-		if total > budget.Limit {
-			return fmt.Errorf("%w: category %q, total %.2f, limit %.2f", ErrBudgetExceeded, tx.Category, total, budget.Limit)
-		}
-	}
-	// Assign IDs only after validation so rejected transactions do not consume IDs.
-	tx.ID = len(transactions) + 1
-	transactions = append(transactions, tx)
+	log.Printf("ledger: connected to Redis (%s)", cache.Describe())
+	kv = redisCache
 	return nil
 }
 
-func ListTransactions() []Transaction {
-	result := make([]Transaction, len(transactions))
-	copy(result, transactions)
-	return result
+// Close releases database and Redis connections.
+func Close() error {
+	var errs []error
+	if err := current.close(); err != nil {
+		errs = append(errs, err)
+	}
+	if c, ok := kv.(interface{ Close() error }); ok {
+		if err := c.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	current, kv = newMemStore(), nil
+	return errors.Join(errs...)
 }
 
-func SetBudget(b Budget) {
-	budgets[b.Category] = b
+// Reset removes all transactions and budgets. It is meant for tests.
+func Reset() error {
+	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+	defer cancel()
+	if err := current.reset(ctx); err != nil {
+		return err
+	}
+	invalidateCache(ctx, budgetsCacheKey, reportCachePrefix)
+	return nil
 }
 
+// AddTransaction validates and saves tx and stores the generated ID in tx.ID.
+// A transaction that would push its category over the budget is rejected
+// with ErrBudgetExceeded and is not saved.
+func AddTransaction(tx *Transaction) error {
+	if tx == nil {
+		return errors.New("transaction must not be nil")
+	}
+	if err := tx.Validate(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+	defer cancel()
+	id, err := current.addTransaction(ctx, *tx)
+	if err != nil {
+		return err
+	}
+	tx.ID = id
+	// Reports for any period may have changed.
+	invalidateCache(ctx, reportCachePrefix)
+	return nil
+}
+
+func ListTransactions() ([]Transaction, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+	defer cancel()
+	return current.listTransactions(ctx)
+}
+
+// SetBudget creates the budget of a category or updates its limit.
+func SetBudget(b Budget) error {
+	if err := b.Validate(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+	defer cancel()
+	if err := current.setBudget(ctx, b); err != nil {
+		return err
+	}
+	invalidateCache(ctx, budgetsCacheKey)
+	return nil
+}
+
+func ListBudgets() ([]Budget, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+	defer cancel()
+	var budgets []Budget
+	if cacheGet(ctx, budgetsCacheKey, &budgets) {
+		return budgets, nil
+	}
+	budgets, err := current.listBudgets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	cacheSet(ctx, budgetsCacheKey, budgets, budgetsCacheTTL)
+	return budgets, nil
+}
+
+// LoadBudgets reads a JSON array of budgets and saves them. The whole input
+// is validated before anything is changed.
 func LoadBudgets(r io.Reader) error {
 	data, err := io.ReadAll(r)
 	if err != nil {
@@ -75,17 +170,15 @@ func LoadBudgets(r io.Reader) error {
 	if loaded == nil {
 		return errors.New("budgets JSON must be an array, not null")
 	}
-	// Validate the entire file before changing the existing budgets.
 	for i, b := range loaded {
-		if strings.TrimSpace(b.Category) == "" {
-			return fmt.Errorf("budget %d: category must not be empty", i+1)
-		}
-		if b.Limit < 0 || math.IsNaN(b.Limit) || math.IsInf(b.Limit, 0) {
-			return fmt.Errorf("budget %d: limit must be a non-negative finite number", i+1)
+		if err := b.Validate(); err != nil {
+			return fmt.Errorf("budget %d: %w", i+1, err)
 		}
 	}
 	for _, b := range loaded {
-		SetBudget(b)
+		if err := SetBudget(b); err != nil {
+			return err
+		}
 	}
 	return nil
 }
